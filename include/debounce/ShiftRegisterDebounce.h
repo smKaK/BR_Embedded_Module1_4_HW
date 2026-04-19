@@ -13,7 +13,10 @@ public:
 
     void        reset(bool initialLevel)                   override;
     bool        update(bool rawLevel, uint32_t now_ms)     override;
-    bool        pending() const                            override { return false; }
+    // Stays true while the window is not unanimous — the driver must keep feeding
+    // samples (the internal interval throttle decides when to actually consume one)
+    // even after ISR activity has stopped, or we'd never reach saturation.
+    bool        pending() const                            override { return reg_ != 0u && reg_ != mask_; }
     const char* name() const                               override;
 
 private:

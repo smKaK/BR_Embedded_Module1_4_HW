@@ -68,46 +68,37 @@ pflash::ModeManager gModes({
 
 ### Debouncing
 
-`Debouncer` is a thin driver that tracks a single `stable` level and reports rising / falling edges to `ButtonController`. It delegates the actual decision of "is this new sample believable?" to an `IDebounceAlgo`. The algorithm interface is tiny — `reset(level)`, `update(rawLevel, now_ms) -> bool`, and a `pending()` hint that tells the driver to keep calling `update` even when the raw level hasn't changed (needed by time-based algorithms). Three implementations ship:
+When a mechanical button is pressed or released, the contact doesn't cleanly snap from one level to the other — it rattles for a few milliseconds, producing a burst of fake edges. A debounce algorithm watches the noisy raw signal and answers one question: *has the line really changed, or is this still bounce?* Each of the three algorithms shipped here gives a different answer to that question, and each one is a legitimate choice depending on what you care about (latency, noise rejection, or CPU cost).
 
-#### HysteresisDebounce — time-based
+#### HysteresisDebounce — "wait until it settles"
 
-Constructor: `HysteresisDebounce(stableMs = 20)`.
+The idea: trust a new level only once it has held steady for long enough. As long as the line keeps flipping, the timer keeps resetting and the output stays put; the moment the raw signal stops changing and stays at the new value for `stableMs`, we commit.
 
-Holds the current `stable` level and a `candidate` level with a timestamp. Each sample:
+This is the most intuitive model — it maps directly onto how a human would explain debouncing ("wait a bit, then look"). Latency is predictable: every real press costs a fixed `stableMs` delay. Noise has to be persistent to get through, but a single very brief spike is still ignored because it resets the timer and then disappears.
 
-- If `raw != candidate`: the candidate changed — adopt the new candidate, restart the timer, keep reporting the old `stable` level.
-- If `raw == candidate` and `candidate != stable` and at least `stableMs` have elapsed since the candidate first appeared: promote `candidate` to `stable`.
+Best when you want simple, bounded, wall-clock-based behavior and the exact sample cadence isn't under your control.
 
-`pending()` returns true while `candidate != stable`, so the driver keeps ticking it even without fresh samples — that lets the level commit purely from the passage of time. Bounce noise resets the timer and so can never promote.
+#### IntegratorDebounce — "weight of evidence"
 
-Trade-off: adds a fixed `stableMs` latency to every real transition, which is the simplest and most predictable behavior. Default `stableMs = 20`, used by both buttons in `main.cpp`.
+The idea: treat each raw sample as one vote. High samples push a counter up, low samples pull it down, and the counter is clamped at both ends. The committed level only flips when the counter reaches the top (enough "high" votes in a row to overpower any recent "low" votes) or the bottom. Between the extremes, the output keeps its last value — so isolated noise samples just nudge the counter a little and quickly get cancelled out.
 
-#### IntegratorDebounce — saturating counter
+This one doesn't care about time — it cares about how lopsided the recent sample history is. A single spurious sample only costs ±1, so brief spikes barely move the needle. But it also means the commit delay depends on how often you sample, not on wall-clock time: sample twice as fast and it commits twice as quickly.
 
-Constructor: `IntegratorDebounce(maxCount = 5)` (clamped to ≥1).
+Best when samples come at a roughly fixed rate and you want graceful degradation against noise rather than a hard "wait N ms" window.
 
-Maintains a counter in `[0, maxCount]`. Each sample: `+1` if `raw` is high, `-1` if low, clamped at the endpoints. The `stable` output only flips when the counter **saturates** — to `true` when it hits `maxCount`, to `false` when it drops to `0`. Between the endpoints the output keeps its last value, which is what gives this algorithm its strong hysteresis.
+#### ShiftRegisterDebounce — "unanimous consensus"
 
-`pending()` is always false: no time-only behavior — every update needs a fresh raw sample.
+The idea: keep the last `width` samples in a rolling window and only commit a new level when *all* of them agree. One mismatching sample anywhere in the window is enough to veto the transition. Samples are taken at most once per `sampleIntervalMs`, so the effective commit delay is `width × sampleIntervalMs`.
 
-Trade-off: forgiving of isolated spikes (one flipped sample costs only `±1` of accumulated counter) but the commit time depends on *how often* you sample, not on wall-clock time. Good when the caller controls sampling cadence; pair with a periodic sampler for predictable timing.
+This is the strictest of the three. It will not commit during any bounce burst, no matter how asymmetric — it needs a completely clean window to flip. The cost is latency: you're essentially waiting for `width` consecutive clean samples. It also scales naturally to very noisy signals by just widening the window or slowing the sample rate.
 
-#### ShiftRegisterDebounce — N-of-N consensus
+Best when the signal is very bouncy or electrically noisy and you'd rather pay extra latency than ever commit a wrong level.
 
-Constructor: `ShiftRegisterDebounce(width = 8, sampleIntervalMs = 1)` (width clamped to `[1, 32]`).
+#### Picking one
 
-Takes at most one sample per `sampleIntervalMs`; older ticks inside the same window are ignored. Each taken sample shifts left into a `width`-bit register:
-
-```
-reg = ((reg << 1) | raw) & mask        // mask = (1 << width) - 1
-```
-
-Output flips to `true` **only** when the register reads all-ones (`width` consecutive high samples at the configured interval), and to `false` only when it reads all-zeros. Any mixed pattern keeps the previous `stable` level.
-
-`pending()` is false; between sample windows the driver can short-circuit. `reset(level)` pre-fills the register with `mask` or `0` so the first real edge still requires `width` fresh samples to confirm.
-
-Trade-off: effectively a tunable FIR filter — commit time is `width × sampleIntervalMs`, and a single opposite sample anywhere inside the window invalidates the consensus. Strongest rejection of fast bounce bursts; slowest to commit.
+- **Hysteresis** — default. Clean buttons, predictable delay, easy to reason about.
+- **Integrator** — sampled at a fixed rate and want the output to "coast" through isolated glitches.
+- **ShiftRegister** — noisy environment, want the firmest guarantee that every commit is preceded by a quiet window.
 
 ### Sampling strategies
 
