@@ -1,4 +1,9 @@
 
+
+https://github.com/user-attachments/assets/5e92ba68-e496-438b-bb5d-fe24497b339d
+
+
+
 # PoliceFlash
 
 Two-channel police-style LED flasher for the **ESP32-S3-DevKitC-1**, built with PlatformIO + Arduino framework. Runs several blink patterns and lets you switch between them live — over the serial console or via hardware buttons — with a pluggable input + debounce stack behind the scenes.
