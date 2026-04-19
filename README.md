@@ -68,11 +68,46 @@ pflash::ModeManager gModes({
 
 ### Debouncing
 
-`Debouncer` is the driver; the actual algorithm lives behind `IDebounceAlgo` so it can be swapped per button:
+`Debouncer` is a thin driver that tracks a single `stable` level and reports rising / falling edges to `ButtonController`. It delegates the actual decision of "is this new sample believable?" to an `IDebounceAlgo`. The algorithm interface is tiny — `reset(level)`, `update(rawLevel, now_ms) -> bool`, and a `pending()` hint that tells the driver to keep calling `update` even when the raw level hasn't changed (needed by time-based algorithms). Three implementations ship:
 
-- **HysteresisDebounce** — commits a new level only after it has held steady for `Nms`.
-- **IntegratorDebounce** — saturating up/down counter; resists noisy spikes.
-- **ShiftRegisterDebounce** — classic N-sample shift register; commits on all-ones / all-zeros.
+#### HysteresisDebounce — time-based
+
+Constructor: `HysteresisDebounce(stableMs = 20)`.
+
+Holds the current `stable` level and a `candidate` level with a timestamp. Each sample:
+
+- If `raw != candidate`: the candidate changed — adopt the new candidate, restart the timer, keep reporting the old `stable` level.
+- If `raw == candidate` and `candidate != stable` and at least `stableMs` have elapsed since the candidate first appeared: promote `candidate` to `stable`.
+
+`pending()` returns true while `candidate != stable`, so the driver keeps ticking it even without fresh samples — that lets the level commit purely from the passage of time. Bounce noise resets the timer and so can never promote.
+
+Trade-off: adds a fixed `stableMs` latency to every real transition, which is the simplest and most predictable behavior. Default `stableMs = 20`, used by both buttons in `main.cpp`.
+
+#### IntegratorDebounce — saturating counter
+
+Constructor: `IntegratorDebounce(maxCount = 5)` (clamped to ≥1).
+
+Maintains a counter in `[0, maxCount]`. Each sample: `+1` if `raw` is high, `-1` if low, clamped at the endpoints. The `stable` output only flips when the counter **saturates** — to `true` when it hits `maxCount`, to `false` when it drops to `0`. Between the endpoints the output keeps its last value, which is what gives this algorithm its strong hysteresis.
+
+`pending()` is always false: no time-only behavior — every update needs a fresh raw sample.
+
+Trade-off: forgiving of isolated spikes (one flipped sample costs only `±1` of accumulated counter) but the commit time depends on *how often* you sample, not on wall-clock time. Good when the caller controls sampling cadence; pair with a periodic sampler for predictable timing.
+
+#### ShiftRegisterDebounce — N-of-N consensus
+
+Constructor: `ShiftRegisterDebounce(width = 8, sampleIntervalMs = 1)` (width clamped to `[1, 32]`).
+
+Takes at most one sample per `sampleIntervalMs`; older ticks inside the same window are ignored. Each taken sample shifts left into a `width`-bit register:
+
+```
+reg = ((reg << 1) | raw) & mask        // mask = (1 << width) - 1
+```
+
+Output flips to `true` **only** when the register reads all-ones (`width` consecutive high samples at the configured interval), and to `false` only when it reads all-zeros. Any mixed pattern keeps the previous `stable` level.
+
+`pending()` is false; between sample windows the driver can short-circuit. `reset(level)` pre-fills the register with `mask` or `0` so the first real edge still requires `width` fresh samples to confirm.
+
+Trade-off: effectively a tunable FIR filter — commit time is `width × sampleIntervalMs`, and a single opposite sample anywhere inside the window invalidates the consensus. Strongest rejection of fast bounce bursts; slowest to commit.
 
 ### Sampling strategies
 
